@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Command Prompt - Smart Persistent Web Edition</title>
+    <!-- Marked.js for Markdown & DOMPurify for security -->
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/dompurify@3.0.6/dist/purify.min.js"></script>
+    <style>
+        * { box-sizing: border-box; }
+        body, html {
+            margin: 0; padding: 0;
+            background-color: #0c0c0c;
+            color: #cccccc;
+            font-family: 'Consolas', 'Lucida Console', 'Courier New', monospace;
+            font-size: 16px;
+            height: 100vh;
+            overflow-y: auto;
+            user-select: text; /* Explicitly allow text selection */
+        }
+        /* Highlight color matching Windows Terminal */
+        ::selection {
+            background-color: #ffffff;
+            color: #0c0c0c;
+        }
+        #terminal {
+            padding: 15px;
+            min-height: 100%;
+            cursor: text;
+        }
+        .header-text {
+            margin-bottom: 16px;
+            line-height: 1.4;
+        }
+        .history-item {
+            margin-top: 6px;
+            margin-bottom: 2px;
+        }
+        .stream-output {
+            white-space: pre-wrap;
+            word-wrap: break-word;
+            margin: 0 0 8px 0;
+            line-height: 1.35;
+        }
+        .error-output {
+            color: #ff5555;
+            white-space: pre-wrap;
+            margin: 0 0 8px 0;
+        }
+        .input-line {
+            display: flex;
+            align-items: center;
+            margin-top: 4px;
+        }
+        .prompt {
+            white-space: pre;
+        }
+        #cmd-input {
+            background: transparent;
+            border: none;
+            color: #cccccc;
+            font-family: inherit;
+            font-size: inherit;
+            flex-grow: 1;
+            outline: none;
+            padding: 0;
+            margin: 0;
+        }
+        #top-controls {
+            position: fixed;
+            top: 8px;
+            right: 16px;
+            display: flex;
+            gap: 8px;
+            z-index: 100;
+        }
+        .badge {
+            font-size: 12px;
+            padding: 4px 10px;
+            border-radius: 4px;
+            background: #1e1e1e;
+            border: 1px solid #333;
+            user-select: none;
+        }
+        #md-toggle {
+            cursor: pointer;
+            color: #4daafc;
+            border-color: #0078d7;
+        }
+        #md-toggle.off {
+            color: #888;
+            border-color: #333;
+        }
+        .status-online { color: #4ec9b0; }
+        .status-running { color: #dcdcaa; }
+        .status-offline { color: #f44747; }
+
+        .markdown-output {
+            background-color: #161616;
+            border-left: 3px solid #0078d7;
+            padding: 10px 16px;
+            margin: 6px 0 12px 0;
+            border-radius: 4px;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: #e6e6e6;
+            white-space: normal;
+            line-height: 1.5;
+        }
+        .markdown-output p {
+            margin: 0.4em 0;
+        }
+        .markdown-output h1, .markdown-output h2, .markdown-output h3 {
+            color: #4daafc;
+            margin-top: 0.4em;
+            margin-bottom: 0.4em;
+        }
+        .markdown-output code {
+            background: #2d2d2d;
+            padding: 2px 5px;
+            border-radius: 3px;
+            font-family: 'Consolas', monospace;
+            color: #dcdcaa;
+        }
+        .markdown-output pre {
+            background: #000000;
+            padding: 10px;
+            border-radius: 4px;
+            overflow-x: auto;
+        }
+        .markdown-output table {
+            border-collapse: collapse;
+            width: 100%;
+            margin: 10px 0;
+        }
+        .markdown-output th, .markdown-output td {
+            border: 1px solid #444;
+            padding: 6px 10px;
+            text-align: left;
+        }
+    </style>
+</head>
+<body>
+    <div id="top-controls">
+        <div id="md-toggle" class="badge" onclick="toggleAutoMarkdown(event)">✨ Auto-Markdown: ON</div>
+        <div id="status-bar" class="badge status-offline">Connecting...</div>
+    </div>
+
+    <div id="terminal">
+        <div class="header-text">
+            Microsoft Windows [Version 10.0.22631.SmartCMD-Persistent]<br>
+            (c) TrySingh. All rights reserved.<br><br>
+            <em>Tips: Highlight text & press <b>Ctrl+C</b> (or Right-Click) to copy. Press <b>Tab</b> to autocomplete paths.</em>
+        </div>
+
+        <div id="output-container"></div>
+
+        <div class="input-line" id="input-container">
+            <span id="prompt-label" class="prompt">{{ initial_prompt }}</span>
+            <input type="text" id="cmd-input" value="" autofocus autocomplete="off" spellcheck="false">
+        </div>
+    </div>
+
+    <script>
+        const input = document.getElementById('cmd-input');
+        input.value = '';
+        const outputContainer = document.getElementById('output-container');
+        const promptLabel = document.getElementById('prompt-label');
+        const statusBar = document.getElementById('status-bar');
+        const mdToggle = document.getElementById('md-toggle');
+
+        let ws;
+        let isRunning = false;
+        let autoMarkdown = true;
+        let currentStreamDiv = null;
+        let currentStreamRaw = "";
+        let currentCwd = {{ initial_cwd | tojson }};
+        let currentPrompt = {{ initial_prompt | tojson }};
+        let commandHistory = [];
+        let historyIndex = -1;
+
+        // Tab Autocomplete State
+        let tabMatches = [];
+        let tabIndex = -1;
+        let tabPrefixCmd = "";
+        let lastTabDirection = 1;
+
+        function resetTabState() {
+            tabMatches = [];
+            tabIndex = -1;
+            tabPrefixCmd = "";
+        }
+
+        // FIXED: Only focus the command input if the user DID NOT highlight text!
+        document.addEventListener('mouseup', (e) => {
+            if (e.target.closest('#top-controls')) return;
+            const selection = window.getSelection().toString();
+            if (selection.length === 0) {
+                input.focus();
+            }
+        });
+
+        // Authentic Windows CMD Right-Click: Copy if text is selected, Paste if nothing is selected
+        document.addEventListener('contextmenu', async (e) => {
+            const selection = window.getSelection().toString();
+            if (selection.length > 0) {
+                e.preventDefault();
+                await navigator.clipboard.writeText(selection);
+                window.getSelection().removeAllRanges(); // Clear highlight like Windows CMD
+                input.focus();
+            }
+        });
+
+        function toggleAutoMarkdown(e) {
+            e.stopPropagation();
+            autoMarkdown = !autoMarkdown;
+            mdToggle.textContent = autoMarkdown ? "✨ Auto-Markdown: ON" : "Auto-Markdown: OFF";
+            mdToggle.className = autoMarkdown ? "badge" : "badge off";
+        }
+
+        function looksLikeMarkdown(text) {
+            return /(\*\*.*?\*\*|`[^`]+`|^#{1,4}\s|^\d+\.\s|^-\s|\*   )/m.test(text);
+        }
+
+        function renderCurrentStream() {
+            if (!currentStreamDiv) return;
+            if (autoMarkdown && looksLikeMarkdown(currentStreamRaw)) {
+                currentStreamDiv.className = 'markdown-output';
+                currentStreamDiv.innerHTML = DOMPurify.sanitize(marked.parse(currentStreamRaw));
+            } else {
+                currentStreamDiv.className = 'stream-output';
+                currentStreamDiv.textContent = currentStreamRaw;
+            }
+        }
+
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            ws = new WebSocket(`${protocol}//${window.location.host}/ws`);
+
+            ws.onopen = () => {
+                statusBar.textContent = '● Connected';
+                statusBar.className = 'status-online';
+            };
+
+            ws.onclose = () => {
+                statusBar.textContent = '○ Disconnected (Reconnecting...)';
+                statusBar.className = 'status-offline';
+                setTimeout(connectWebSocket, 2000);
+            };
+
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+
+                if (msg.type === 'stream') {
+                    if (!currentStreamDiv) {
+                        currentStreamDiv = document.createElement('div');
+                        currentStreamDiv.className = 'stream-output';
+                        currentStreamRaw = "";
+                        outputContainer.appendChild(currentStreamDiv);
+                    }
+                    currentStreamRaw += msg.data;
+                    renderCurrentStream();
+                }
+                else if (msg.type === 'markdown') {
+                    const mdDiv = document.createElement('div');
+                    mdDiv.className = 'markdown-output';
+                    mdDiv.innerHTML = DOMPurify.sanitize(marked.parse(msg.data));
+                    outputContainer.appendChild(mdDiv);
+                }
+                else if (msg.type === 'error') {
+                    const errDiv = document.createElement('div');
+                    errDiv.className = 'error-output';
+                    errDiv.textContent = msg.data;
+                    outputContainer.appendChild(errDiv);
+                }
+                else if (msg.type === 'complete') {
+                    isRunning = false;
+                    currentStreamDiv = null;
+                    currentStreamRaw = "";
+                    currentCwd = msg.cwd;
+                    currentPrompt = msg.prompt || `${currentCwd}>`;
+                    promptLabel.textContent = currentPrompt;
+                    statusBar.textContent = '● Connected';
+                    statusBar.className = 'status-online';
+                }
+                else if (msg.type === 'autocomplete') {
+                    if (msg.matches && msg.matches.length > 0) {
+                        tabMatches = msg.matches;
+                        tabPrefixCmd = msg.prefix_cmd;
+                        tabIndex = lastTabDirection > 0 ? 0 : tabMatches.length - 1;
+                        input.value = tabPrefixCmd + tabMatches[tabIndex];
+                    }
+                }
+
+                // Only auto-scroll if user isn't actively highlighting text
+                if (window.getSelection().toString().length === 0) {
+                    window.scrollTo(0, document.body.scrollHeight);
+                }
+            };
+        }
+
+        connectWebSocket();
+
+        // Global Keyboard Listener: Smart Copy vs. Kill, plus Auto-Focus when typing
+        document.addEventListener('keydown', async (e) => {
+            const selection = window.getSelection().toString();
+
+            // Handle Ctrl+C
+            if (e.ctrlKey && e.key.toLowerCase() === 'c') {
+                if (selection.length > 0) {
+                    // Let browser copy selected text naturally
+                    return;
+                } else if (isRunning) {
+                    // No text selected + command is running -> send Ctrl+C interrupt
+                    e.preventDefault();
+                    ws.send(JSON.stringify({ action: 'kill' }));
+                    return;
+                }
+            }
+
+            // If user starts typing a normal character or Ctrl+V while input isn't focused, focus it
+            if (document.activeElement !== input && !e.ctrlKey && !e.altKey && !e.metaKey && e.key.length === 1) {
+                input.focus();
+            } else if (e.ctrlKey && e.key.toLowerCase() === 'v' && document.activeElement !== input) {
+                input.focus();
+            }
+        });
+
+        input.addEventListener('keydown', (e) => {
+            // Handle Tab & Shift+Tab Autocomplete
+            if (e.key === 'Tab') {
+                e.preventDefault();
+                if (isRunning) return;
+
+                lastTabDirection = e.shiftKey ? -1 : 1;
+
+                if (tabMatches.length > 0) {
+                    tabIndex = (tabIndex + lastTabDirection + tabMatches.length) % tabMatches.length;
+                    input.value = tabPrefixCmd + tabMatches[tabIndex];
+                } else {
+                    ws.send(JSON.stringify({ action: 'autocomplete', text: input.value }));
+                }
+                return;
+            }
+
+            if (e.key !== 'Shift') {
+                resetTabState();
+            }
+
+            // Up Arrow (History)
+            if (e.key === 'ArrowUp' && !isRunning) {
+                e.preventDefault();
+                if (historyIndex > 0) {
+                    historyIndex--;
+                    input.value = commandHistory[historyIndex];
+                }
+            }
+            // Down Arrow (History)
+            else if (e.key === 'ArrowDown' && !isRunning) {
+                e.preventDefault();
+                if (historyIndex < commandHistory.length - 1) {
+                    historyIndex++;
+                    input.value = commandHistory[historyIndex];
+                } else {
+                    historyIndex = commandHistory.length;
+                    input.value = '';
+                }
+            }
+            // Enter Key
+            else if (e.key === 'Enter') {
+                const text = input.value;
+                input.value = '';
+
+                if (isRunning) {
+                    if (currentStreamDiv) {
+                        currentStreamRaw += text + '\n';
+                        renderCurrentStream();
+                        currentStreamDiv = null;
+                        currentStreamRaw = "";
+                    }
+                    ws.send(JSON.stringify({ action: 'stdin', data: text }));
+                    return;
+                }
+
+                if (text.trim() !== '') {
+                    commandHistory.push(text);
+                    historyIndex = commandHistory.length;
+                }
+
+                const cmdEcho = document.createElement('div');
+                cmdEcho.className = 'history-item';
+                cmdEcho.textContent = `${currentPrompt}${text}`;
+                outputContainer.appendChild(cmdEcho);
+
+                if (text.trim().toLowerCase() === 'cls') {
+                    outputContainer.innerHTML = '';
+                    return;
+                }
+
+                isRunning = true;
+                promptLabel.textContent = '';
+                statusBar.textContent = '⚡ Running (Ctrl+C to stop)';
+                statusBar.className = 'status-running';
+
+                ws.send(JSON.stringify({ action: 'execute', command: text }));
+                window.scrollTo(0, document.body.scrollHeight);
+            }
+        });
+    </script>
+</body>
+</html>
